@@ -3,6 +3,7 @@
 #include "rclcpp/rclcpp.hpp"
 #include "sensor_msgs/msg/image.hpp"
 #include "std_msgs/msg/string.hpp"
+#include "yolov5.h"
 
 #include <atomic>
 #include <condition_variable>
@@ -105,6 +106,9 @@ private:
     // 发布 RGA 转换后的 RGB888 图像。
     void publish_rgb_frame(const FramePtr & frame);
 
+    bool initialize_detection();
+    void shutdown_detection();
+
     // 外部传入的 ROS 节点句柄，用于日志、时间戳、publisher 等 ROS 能力。
     rclcpp::Node::SharedPtr node_;
 
@@ -114,6 +118,14 @@ private:
 
     // 发布 RGA 转换后的 RGB 图像。
     rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr image_publisher_;
+
+    rknn_app_context_t rknn_app_ctx_{};
+    bool post_process_ready_{false};
+    bool detection_ready_{false};
+    bool enable_preview_{true};
+    std::string model_path_;
+    std::string label_path_;
+    std::string capture_device_{"/dev/video9"};
 
     // 全局运行标志，所有工作线程都根据它决定是否继续循环。
     std::atomic<bool> running_{false};

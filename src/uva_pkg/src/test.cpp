@@ -1,8 +1,12 @@
 #include "test.hpp"
 
+#include <ament_index_cpp/get_package_share_directory.hpp>
+
 #include <im2d.hpp>
+#include <rga.h>
 #include <opencv2/highgui.hpp>
 #include <opencv2/imgproc.hpp>
+#include "opencv2/core/core.hpp"
 
 #include <algorithm>
 #include <cerrno>
@@ -16,12 +20,61 @@
 #include <sys/mman.h>
 #include <sys/select.h>
 #include <unistd.h>
+#include "image_drawing.h"
+#include "image_utils.h"
+
+
+#include "yolov5.h"
 
 namespace
 {
 constexpr std::uint32_t kRgaRgbStrideAlignment = 16;
-constexpr const char * kCaptureDevice = "/dev/video9";
+constexpr const char * kDefaultCaptureDevice = "/dev/video9";
 constexpr const char * kPreviewWindowName = "uva_rgb_preview";
+
+bool file_exists(const std::string & path)
+{
+    return !path.empty() && access(path.c_str(), F_OK) == 0;
+}
+
+std::string join_path(const std::string & base, const std::string & relative)
+{
+    if (base.empty()) {
+        return relative;
+    }
+
+    if (base.back() == '/') {
+        return base + relative;
+    }
+
+    return base + "/" + relative;
+}
+
+std::string resolve_default_asset_path(const std::string & relative_path)
+{
+    std::vector<std::string> candidates;
+
+    try {
+        candidates.push_back(join_path(
+            ament_index_cpp::get_package_share_directory("uva_pkg"),
+            relative_path));
+    } catch (const std::exception &) {
+        // Fall back to source-tree and legacy container locations below.
+    }
+
+#ifdef UVA_PKG_SOURCE_DIR
+    candidates.push_back(join_path(UVA_PKG_SOURCE_DIR, relative_path));
+#endif
+    candidates.push_back(join_path("/app", relative_path));
+
+    for (const auto & candidate : candidates) {
+        if (file_exists(candidate)) {
+            return candidate;
+        }
+    }
+
+    return candidates.empty() ? relative_path : candidates.front();
+}
 }  // namespace
 
 namespace test_space
@@ -32,12 +85,34 @@ Test::Test(rclcpp::Node::SharedPtr node)
     publisher_ = node_->create_publisher<std_msgs::msg::String>("topic", 10);
     save_test_publisher_ = node_->create_publisher<std_msgs::msg::String>("save_test", 10);
     image_publisher_ = node_->create_publisher<sensor_msgs::msg::Image>("rgb_image", 10);
-    RCLCPP_INFO(node_->get_logger(), "Test pipeline initialized.");
+    std::memset(&rknn_app_ctx_, 0, sizeof(rknn_app_ctx_));
+
+    model_path_ = node_->declare_parameter<std::string>(
+        "model_path",
+        resolve_default_asset_path("model/best.rknn"));
+    label_path_ = node_->declare_parameter<std::string>(
+        "label_path",
+        resolve_default_asset_path("model/apple.txt"));
+    capture_device_ = node_->declare_parameter<std::string>(
+        "capture_device",
+        kDefaultCaptureDevice);
+    enable_preview_ = node_->declare_parameter<bool>("enable_preview", true);
+
+    RCLCPP_INFO(
+        node_->get_logger(),
+        "Test pipeline initialized. model=%s label=%s capture_device=%s preview=%s",
+        model_path_.c_str(),
+        label_path_.c_str(),
+        capture_device_.c_str(),
+        enable_preview_ ? "true" : "false");
+
+    initialize_detection();
 }
 
 Test::~Test()
 {
     stop();
+    shutdown_detection();
     RCLCPP_INFO(node_->get_logger(), "Test pipeline destroyed.");
 }
 
@@ -81,11 +156,12 @@ void Test::stop()
     }
 
     capture_cleanup();
-
-    try {
-        cv::destroyWindow(kPreviewWindowName);
-    } catch (const cv::Exception &) {
-        // Ignore GUI teardown errors when no display backend is available.
+    if (enable_preview_) {
+        try {
+            cv::destroyWindow(kPreviewWindowName);
+        } catch (const cv::Exception &) {
+            // Ignore GUI teardown errors when no display backend is available.
+        }
     }
 
     RCLCPP_INFO(node_->get_logger(), "Worker threads stopped.");
@@ -235,12 +311,12 @@ void Test::configure_rga_output_layout()
 
 bool Test::capture_initialize()
 {
-    m_fd = open(kCaptureDevice, O_RDWR | O_NONBLOCK, 0);
+    m_fd = open(capture_device_.c_str(), O_RDWR | O_NONBLOCK, 0);
     if (m_fd < 0) {
         RCLCPP_ERROR(
             node_->get_logger(),
             "Failed to open %s: %s",
-            kCaptureDevice,
+            capture_device_.c_str(),
             std::strerror(errno));
         return false;
     }
@@ -257,7 +333,7 @@ bool Test::capture_initialize()
         RCLCPP_ERROR(
             node_->get_logger(),
             "VIDIOC_S_FMT failed on %s: %s",
-            kCaptureDevice,
+            capture_device_.c_str(),
             std::strerror(errno));
         capture_cleanup();
         return false;
@@ -270,7 +346,10 @@ bool Test::capture_initialize()
     frame_bytes_ = fmt.fmt.pix.sizeimage != 0 ? fmt.fmt.pix.sizeimage : capture_stride_ * capture_height_;
 
     if (capture_pixel_format_ != V4L2_PIX_FMT_YUYV) {
-        RCLCPP_ERROR(node_->get_logger(), "Camera did not accept YUYV capture format on %s.", kCaptureDevice);
+        RCLCPP_ERROR(
+            node_->get_logger(),
+            "Camera did not accept YUYV capture format on %s.",
+            capture_device_.c_str());
         capture_cleanup();
         return false;
     }
@@ -344,7 +423,7 @@ bool Test::capture_initialize()
     RCLCPP_INFO(
         node_->get_logger(),
         "V4L2 capture ready on %s: %ux%u stride=%u bytes=%zu format=YUYV, RGA RGB stride=%u row_bytes=%u",
-        kCaptureDevice,
+        capture_device_.c_str(),
         capture_width_,
         capture_height_,
         capture_stride_,
@@ -523,22 +602,72 @@ void Test::detect_loop()
         }
 
 
-
-
         cv::Mat rgb_frame(
                     static_cast<int>(frame->height),
                     static_cast<int>(frame->width),
                     CV_8UC3,
                     frame->converted_data.data(),
                     static_cast<std::size_t>(frame->converted_stride) * 3U);
-        cv::Mat bgr_frame;
-        cv::cvtColor(rgb_frame, bgr_frame, cv::COLOR_RGB2BGR);
-        cv::imshow(kPreviewWindowName, bgr_frame);
-        cv::waitKey(1);
+        //使用RGB  MAT类型图像进行目标检测
+        image_buffer_t src_image;
+        memset(&src_image, 0, sizeof(image_buffer_t));
+        src_image.width = rgb_frame.cols;
+        src_image.height = rgb_frame.rows;
+        src_image.width_stride = static_cast<int>(frame->converted_stride);
+        src_image.height_stride = rgb_frame.rows;
+        src_image.format = (rgb_frame.channels() == 1) ? IMAGE_FORMAT_GRAY8 : IMAGE_FORMAT_RGB888;
+        src_image.virt_addr = rgb_frame.data;
+        src_image.size = static_cast<int>(frame->converted_data_size);
+        src_image.fd = -1;
 
+        if (detection_ready_) {
+            object_detect_result_list od_results;
+            const int ret = inference_yolov5_model(&rknn_app_ctx_, &src_image, &od_results);
+            if (ret != 0) {
+                RCLCPP_WARN(
+                    node_->get_logger(),
+                    "inference_yolov5_model failed on frame %llu: ret=%d",
+                    static_cast<unsigned long long>(frame->frame_id),
+                    ret);
+                release_frame_reference(frame);
+                continue;
+            }
 
-        //publish_rgb_frame(frame);//发布的时候会卡
+            char text[256];
+            for (int i = 0; i < od_results.count; i++) {
+                object_detect_result *det_result = &(od_results.results[i]);
+                const int x1 = det_result->box.left;
+                const int y1 = det_result->box.top;
+                const int x2 = det_result->box.right;
+                const int y2 = det_result->box.bottom;
 
+                draw_rectangle(&src_image, x1, y1, x2 - x1, y2 - y1, COLOR_BLUE, 3);
+                snprintf(
+                    text,
+                    sizeof(text),
+                    "%s %.1f%%",
+                    coco_cls_to_name(det_result->cls_id),
+                    det_result->prop * 100);
+                draw_text(&src_image, text, x1, y1 - 20, COLOR_RED, 10);
+            }
+        }
+
+        if (enable_preview_) {
+            try {
+                cv::Mat bgr_frame;
+                cv::cvtColor(rgb_frame, bgr_frame, cv::COLOR_RGB2BGR);
+                cv::imshow(kPreviewWindowName, bgr_frame);
+                cv::waitKey(1);
+            } catch (const cv::Exception & ex) {
+                RCLCPP_ERROR(
+                    node_->get_logger(),
+                    "Preview display failed: %s. Preview has been disabled.",
+                    ex.what());
+                enable_preview_ = false;
+            }
+        }
+
+        // publish_rgb_frame(frame);  // 发布时仍有卡顿，先保留调用点。
 
         if (frame->frame_id % 60 == 0) {
             RCLCPP_INFO(
@@ -599,5 +728,60 @@ void Test::publish_rgb_frame(const FramePtr & frame)
     message.data = frame->converted_data;
 
     image_publisher_->publish(std::move(message));
+}
+
+bool Test::initialize_detection()
+{
+    if (!file_exists(model_path_)) {
+        RCLCPP_ERROR(node_->get_logger(), "RKNN model file not found: %s", model_path_.c_str());
+        return false;
+    }
+
+    if (!file_exists(label_path_)) {
+        RCLCPP_ERROR(node_->get_logger(), "Label file not found: %s", label_path_.c_str());
+        return false;
+    }
+
+    const int post_process_ret = init_post_process(label_path_.c_str());
+    if (post_process_ret != 0) {
+        RCLCPP_ERROR(
+            node_->get_logger(),
+            "init_post_process failed: ret=%d label_path=%s",
+            post_process_ret,
+            label_path_.c_str());
+        return false;
+    }
+    post_process_ready_ = true;
+
+    const int model_ret = init_yolov5_model(model_path_.c_str(), &rknn_app_ctx_);
+    if (model_ret != 0) {
+        RCLCPP_ERROR(
+            node_->get_logger(),
+            "init_yolov5_model failed: ret=%d model_path=%s",
+            model_ret,
+            model_path_.c_str());
+        shutdown_detection();
+        return false;
+    }
+
+    detection_ready_ = true;
+    return true;
+}
+
+void Test::shutdown_detection()
+{
+    if (detection_ready_ || rknn_app_ctx_.rknn_ctx != 0 || rknn_app_ctx_.input_attrs != nullptr ||
+        rknn_app_ctx_.output_attrs != nullptr)
+    {
+        release_yolov5_model(&rknn_app_ctx_);
+    }
+
+    if (post_process_ready_) {
+        deinit_post_process();
+    }
+
+    detection_ready_ = false;
+    post_process_ready_ = false;
+    std::memset(&rknn_app_ctx_, 0, sizeof(rknn_app_ctx_));
 }
 }  // namespace test_space
