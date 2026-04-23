@@ -33,7 +33,7 @@ RUN git clone --depth 1 --branch main https://github.com/airockchip/librga.git /
 COPY ./src ./src
 
 RUN source /opt/ros/${ROS_DISTRO}/setup.bash && \
-    colcon build --packages-select uva_pkg --merge-install --cmake-args -DCMAKE_BUILD_TYPE=Release
+    colcon build --packages-select uva_pkg imu_pkg --merge-install --cmake-args -DCMAKE_BUILD_TYPE=Release
 
 FROM ros:${ROS_DISTRO}-ros-base AS runtime
 ARG ROS_DISTRO
@@ -54,7 +54,11 @@ RUN apt-get update && \
       libglib2.0-0 \
       libgtk-3-0 \
       libopencv-dev \
-      ros-${ROS_DISTRO}-ament-index-cpp && \
+      ros-${ROS_DISTRO}-ament-index-cpp \
+      ros-${ROS_DISTRO}-launch \
+      ros-${ROS_DISTRO}-launch-ros \
+      ros-${ROS_DISTRO}-ros2launch \
+      ros-${ROS_DISTRO}-sensor-msgs && \
     rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /usr/local/lib/librga.so /usr/local/lib/librga.so
@@ -65,4 +69,4 @@ COPY --from=builder /ros_app/install /ros_app/install
 RUN echo "source /opt/ros/${ROS_DISTRO}/setup.bash" >> /root/.bashrc && \
     echo "source /ros_app/install/setup.bash" >> /root/.bashrc
 
-CMD ["/bin/bash", "-c", "source /opt/ros/${ROS_DISTRO}/setup.bash && source /ros_app/install/setup.bash && ros2 run uva_pkg uva_node"]
+CMD ["/bin/bash", "-c", "source /opt/ros/${ROS_DISTRO}/setup.bash && source /ros_app/install/setup.bash && ros2 launch imu_pkg imu_uva.launch.py"]

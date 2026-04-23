@@ -179,7 +179,7 @@ void Test::initialize_frame_pool(std::size_t frame_count)
 
     for (std::size_t i = 0; i < frame_count; ++i) {
         auto frame = std::make_shared<Frame>();
-        frame->width = capture_width_;
+        frame->width  = capture_width_;
         frame->height = capture_height_;
         frame->stride = capture_stride_;
         frame->pixel_format = capture_pixel_format_;
@@ -239,8 +239,7 @@ void Test::dispatch_frame(const FramePtr & frame)
         std::lock_guard<std::mutex> lock(detect_mutex_);
         frame->ref_count.fetch_add(1);
         detect_queue_.push(frame);
-        notify_detect = true;
-      
+        notify_detect = true; 
     }
 
     {
